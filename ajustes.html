@@ -405,6 +405,28 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
           <span style="color:var(--text-dim); font-size:13px;">›</span>
         </div>
       </div>
+
+      <div class="settings-group">
+        <h3>Teléfonos vinculados</h3>
+        <p style="font-size:11.5px; color:var(--text-dim); margin-bottom:12px; line-height:1.5;">
+          Solo 2 teléfonos pueden vincularse al vehículo por Bluetooth. Necesitas
+          estar conectado con uno ya autorizado para agregar o quitar teléfonos.
+        </p>
+        <div class="list-row" onclick="pairNewPhone()" style="cursor:pointer;">
+          <div>
+            <div class="list-row-label">Vincular un teléfono nuevo</div>
+            <div class="list-row-sub">Abre el segundo espacio por 60 segundos</div>
+          </div>
+          <span style="color:var(--text-dim); font-size:13px;">›</span>
+        </div>
+        <div class="list-row" onclick="forgetPhones()" style="cursor:pointer;">
+          <div>
+            <div class="list-row-label" style="color:var(--danger);">Olvidar todos los teléfonos</div>
+            <div class="list-row-sub">Libera los 2 espacios para volver a vincular</div>
+          </div>
+          <span style="color:var(--text-dim); font-size:13px;">›</span>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -480,11 +502,15 @@ function confirmStop() {
 }
 
 // ==========================================================================
-// Estado de conexión Bluetooth con el vehículo (solo lectura en esta página)
+// Conexión Bluetooth con el vehículo — lectura de estado y envío de comandos
+// de gestión de teléfonos vinculados (PAIR_MODE, FORGET_PHONES)
 // ==========================================================================
-const BLE_SERVICE    = '12345678-1234-5678-1234-56789abcdef0';
-const BLE_STATUS_CHAR = '12345678-1234-5678-1234-56789abcdef2';
+const BLE_SERVICE     = '12345678-1234-5678-1234-56789abcdef0';
+const BLE_CMD_CHAR     = '12345678-1234-5678-1234-56789abcdef1';
+const BLE_STATUS_CHAR  = '12345678-1234-5678-1234-56789abcdef2';
 let bleDevice = null;
+let bleCmdChar = null;
+let bleConnected = false;
 
 function setStatusPill(connected, armed) {
   const dot = document.getElementById('statusDot');
@@ -499,28 +525,86 @@ function setStatusPill(connected, armed) {
   if (dot) dot.style.background = 'var(--accent)';
 }
 
+async function gattConnect() {
+  const server = await bleDevice.gatt.connect();
+  const service = await server.getPrimaryService(BLE_SERVICE);
+  bleCmdChar = await service.getCharacteristic(BLE_CMD_CHAR);
+  const statusChar = await service.getCharacteristic(BLE_STATUS_CHAR);
+  await statusChar.startNotifications();
+  statusChar.addEventListener('characteristicvaluechanged', (e) => {
+    try {
+      const s = JSON.parse(new TextDecoder().decode(e.target.value));
+      setStatusPill(true, s.armed);
+    } catch (err) {}
+  });
+  bleDevice.addEventListener('gattserverdisconnected', () => {
+    bleConnected = false;
+    setStatusPill(false);
+  });
+  bleConnected = true;
+  setStatusPill(true, true);
+}
+
 async function tryReconnectBLE() {
   if (!navigator.bluetooth || !navigator.bluetooth.getDevices) { setStatusPill(false); return; }
   try {
     const devices = await navigator.bluetooth.getDevices();
     if (!devices.length) { setStatusPill(false); return; }
     bleDevice = devices[0];
-    const server = await bleDevice.gatt.connect();
-    const service = await server.getPrimaryService(BLE_SERVICE);
-    const statusChar = await service.getCharacteristic(BLE_STATUS_CHAR);
-    await statusChar.startNotifications();
-    statusChar.addEventListener('characteristicvaluechanged', (e) => {
-      try {
-        const s = JSON.parse(new TextDecoder().decode(e.target.value));
-        setStatusPill(true, s.armed);
-      } catch (err) {}
-    });
-    bleDevice.addEventListener('gattserverdisconnected', () => setStatusPill(false));
-    setStatusPill(true, true);
+    await gattConnect();
   } catch (err) {
     setStatusPill(false);
   }
 }
+
+async function connectBLE() {
+  if (!navigator.bluetooth) {
+    toast('Este navegador no soporta Bluetooth (usa Chrome en Android)');
+    return;
+  }
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] });
+    await gattConnect();
+    toast('Vinculado con el vehículo');
+  } catch (err) {
+    toast('No se pudo vincular: ' + err.message);
+  }
+}
+
+async function sendCmd(cmd) {
+  if (!bleConnected || !bleCmdChar) {
+    toast('Sin conexión Bluetooth — conéctate primero desde Control');
+    return;
+  }
+  try {
+    await bleCmdChar.writeValue(new TextEncoder().encode(cmd));
+  } catch (err) {
+    toast('Error enviando comando: ' + err.message);
+  }
+}
+
+async function pairNewPhone() {
+  if (!bleConnected) {
+    await connectBLE();
+    if (!bleConnected) return;
+  }
+  if (confirm('¿Abrir 60 segundos para vincular un teléfono nuevo? Durante ese tiempo, cualquier teléfono que se conecte quedará autorizado.')) {
+    sendCmd('PAIR_MODE');
+    toast('Ventana de vinculación abierta — conecta el teléfono nuevo ahora');
+  }
+}
+
+async function forgetPhones() {
+  if (!bleConnected) {
+    await connectBLE();
+    if (!bleConnected) return;
+  }
+  if (confirm('¿Olvidar los 2 teléfonos vinculados? Vas a necesitar volver a vincular este mismo teléfono también.')) {
+    sendCmd('FORGET_PHONES');
+    toast('Teléfonos olvidados — ventana de vinculación abierta 60s');
+  }
+}
+
 window.addEventListener('load', tryReconnectBLE);
 
 // ---------- Registro del Service Worker ----------
