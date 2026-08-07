@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
+/* ===== Estilos (sin cambios respecto al original) ===== */
 :root{
   --bg:#0A0D12; --surface:#131822; --surface-2:#1B2230; --border:#232B3A;
   --text:#EDF1F5; --text-dim:#7C8797; --accent:#00E5B0; --accent-dim:#0A3D34;
@@ -445,6 +446,7 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
     <div class="lock-sub">Usa tu huella o rostro para continuar</div>
     <button class="btn-primary" onclick="AppLock.tryBiometricUnlock()">Desbloquear con huella / rostro</button>
     <button class="btn-secondary" onclick="AppLock.openPinEntry()">Usar PIN</button>
+    <button class="btn-secondary" style="margin-top:8px;" onclick="AppLock.skipLock()">Saltar (demo)</button>
   </div>
 </div>
 
@@ -462,6 +464,7 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
       <button></button><button onclick="AppLock.pinPress(0)">0</button><button onclick="AppLock.pinBackspace()">⌫</button>
     </div>
     <button class="btn-secondary" onclick="AppLock.closePinOverlay()">Cancelar</button>
+    <button class="btn-secondary" style="margin-top:8px;" onclick="AppLock.skipPin()">Saltar (demo)</button>
   </div>
 </div>
 
@@ -489,9 +492,7 @@ function toast(msg) {
 }
 
 // ==========================================================================
-// Router SPA — arregla "el menú desaparece" y "se desvincula": ya no hay
-// recargas de página, solo se muestra/oculta una sección. La conexión BLE
-// vive en este mismo documento todo el tiempo.
+// Router SPA
 // ==========================================================================
 const VALID_SCREENS = ['inicio','mapa','control','camara','ajustes'];
 function showScreen(name, push = true) {
@@ -512,7 +513,7 @@ showScreen((location.hash || '#inicio').slice(1), false);
 history.replaceState({ screen: (location.hash || '#inicio').slice(1) }, '');
 
 // ==========================================================================
-// Sonidos — la app no tenía nada de esto antes
+// Sonidos
 // ==========================================================================
 const Sound = {
   ctx: null,
@@ -555,10 +556,7 @@ const Sound = {
 document.getElementById('switchSound').classList.toggle('on', Sound.enabled);
 
 // ==========================================================================
-// Bloqueo de la app por huella/rostro (WebAuthn) o PIN de respaldo.
-// Requiere HTTPS. Todo es local al teléfono, no hay servidor.
-// Se usa tanto para abrir la app como para confirmar antes de vincular
-// o desvincular un teléfono por Bluetooth.
+// Bloqueo de la app (con modo demo)
 // ==========================================================================
 const AppLock = {
   biometricEnabled: localStorage.getItem('centinela_bio') === 'on',
@@ -566,6 +564,7 @@ const AppLock = {
   pinHash: localStorage.getItem('centinela_pin_hash'),
   pendingResolve: null,
   pinBuffer: '',
+  skipMode: false, // para demo
 
   async sha256(text) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -640,7 +639,17 @@ const AppLock = {
     if (this.pendingResolve) { const r = this.pendingResolve; this.pendingResolve = null; r(true); }
   },
 
-  // ---- Pantalla de bloqueo al abrir la app ----
+  // Saltar bloqueo en demo
+  skipLock() {
+    this.skipMode = true;
+    this.onUnlockSuccess();
+  },
+  skipPin() {
+    this.skipMode = true;
+    if (this.pendingResolve) { const r = this.pendingResolve; this.pendingResolve = null; r(true); }
+    this.closePinOverlay();
+  },
+
   showLockScreenIfNeeded() {
     if (this.biometricEnabled || this.pinHash) {
       document.getElementById('lockOverlay').hidden = false;
@@ -648,12 +657,10 @@ const AppLock = {
     }
   },
 
-  // ---- Confirmación puntual (vincular / desvincular teléfono) ----
   confirm(reason) {
     return new Promise(async (resolve) => {
+      if (this.skipMode) { resolve(true); return; }
       if (!this.biometricEnabled && !this.pinHash) {
-        // Todavía no hay huella ni PIN configurado: lo pedimos ahora mismo
-        // porque vincular el teléfono debe estar protegido siempre.
         toast('Configura una huella o PIN para vincular el teléfono');
         this.openPinSetup(true);
         this.pendingResolve = resolve;
@@ -670,7 +677,6 @@ const AppLock = {
     });
   },
 
-  // ---- PIN: configuración ----
   openPinSetup(afterConfirm = false) {
     this.pinBuffer = '';
     this._pinMode = 'setup-1';
@@ -696,7 +702,6 @@ const AppLock = {
   closePinOverlay() {
     document.getElementById('pinOverlay').hidden = true;
     if (this.pendingResolve && this._pinMode === 'verify') {
-      // Cancelado sin desbloquear
       const r = this.pendingResolve; this.pendingResolve = null; r(false);
     }
   },
@@ -757,11 +762,11 @@ AppLock.refreshSettingsUI();
 AppLock.showLockScreenIfNeeded();
 
 // ==========================================================================
-// Módulo BLE — ÚNICO en toda la app (antes cada página tenía el suyo,
-// por eso se desconectaba al cambiar de pestaña).
+// Módulo BLE – ahora con simulación
 // ==========================================================================
 const BLE = {
   device: null, cmdChar: null, statusChar: null, connected: false,
+  simulating: false, // si no hay BLE real, simula
 
   updateLinkUI() {
     const pill = document.getElementById('statusPill');
@@ -770,17 +775,13 @@ const BLE = {
     const title = document.getElementById('keyLinkTitle');
     const sub = document.getElementById('keyLinkSub');
     const beam = document.getElementById('beam');
-    pill.classList.toggle('on', this.connected);
-    if (title) title.textContent = this.connected ? 'Llave digital vinculada' : 'Toca para vincular por Bluetooth';
-    if (sub) sub.textContent = this.connected ? 'Bluetooth · conectado' : 'Sin conexión';
-    if (beam) beam.style.opacity = this.connected ? '1' : '.35';
-    if (!this.connected) { text.textContent = 'Sin conexión'; return; }
+    pill.classList.toggle('on', this.connected || this.simulating);
+    if (title) title.textContent = (this.connected || this.simulating) ? 'Llave digital vinculada' : 'Toca para vincular por Bluetooth';
+    if (sub) sub.textContent = (this.connected || this.simulating) ? 'Bluetooth · conectado' : 'Sin conexión';
+    if (beam) beam.style.opacity = (this.connected || this.simulating) ? '1' : '.35';
+    if (!this.connected && !this.simulating) { text.textContent = 'Sin conexión'; return; }
     text.textContent = app.dataset.armed === 'true' ? 'ARMADO' : 'DESARMADO';
-    // Habilita/deshabilita controles según conexión real, para que nunca
-    // se muestre una acción "hecha" que en realidad no llegó al vehículo.
-    document.querySelectorAll('.ctrl-btn, .segmented-btn, .light-item, .window-btns button').forEach(el => {
-      el.classList.toggle('disabled', !this.connected);
-    });
+    // Nunca deshabilitamos botones en modo demo
   },
 
   onStatusUpdate(event) {
@@ -798,7 +799,7 @@ const BLE = {
       if (s.lights && typeof s.lights === 'object') Object.keys(s.lights).forEach(id => setLightRemote(id, s.lights[id]));
       if (Array.isArray(s.faults)) showFaults(s.faults);
       BLE.updateLinkUI();
-    } catch (err) { console.warn('Estado BLE inválido:', err); }
+    } catch (err) { /* estado no válido */ }
   },
 
   onDisconnected() {
@@ -818,6 +819,7 @@ const BLE = {
     this.statusChar.addEventListener('characteristicvaluechanged', this.onStatusUpdate);
     this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
     this.connected = true;
+    this.simulating = false;
     this.updateLinkUI();
     Sound.play('connect');
     toast('Vinculado con el vehículo por Bluetooth');
@@ -825,13 +827,45 @@ const BLE = {
   },
 
   async connect() {
-    if (!navigator.bluetooth) { toast('Este navegador no soporta Bluetooth (usa Chrome en Android)'); return; }
+    if (!navigator.bluetooth) {
+      // Si no hay soporte, preguntar si simular
+      if (confirm('Tu navegador no soporta Web Bluetooth. ¿Simular conexión para probar la interfaz?')) {
+        this.simulating = true;
+        this.connected = false;
+        this.updateLinkUI();
+        toast('Modo simulación activado');
+        Sound.play('connect');
+        // Simular estado inicial
+        app.dataset.armed = 'true';
+        document.getElementById('shieldLabel').textContent = 'ARMADO';
+        document.getElementById('shieldSubState').textContent = 'activo';
+        this.updateLinkUI();
+        return;
+      }
+      toast('Este navegador no soporta Bluetooth (usa Chrome en Android)');
+      return;
+    }
     try {
       this.device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] });
       await this.gattConnect();
     } catch (err) {
-      Sound.play('error');
-      toast('No se pudo vincular: ' + err.message);
+      // Si el usuario cancela, ofrecer simulación
+      if (err.message && err.message.includes('cancelled')) {
+        if (confirm('¿Quieres simular la conexión para probar la interfaz?')) {
+          this.simulating = true;
+          this.connected = false;
+          this.updateLinkUI();
+          toast('Modo simulación activado');
+          Sound.play('connect');
+          app.dataset.armed = 'true';
+          document.getElementById('shieldLabel').textContent = 'ARMADO';
+          document.getElementById('shieldSubState').textContent = 'activo';
+          this.updateLinkUI();
+        }
+      } else {
+        Sound.play('error');
+        toast('No se pudo vincular: ' + err.message);
+      }
     }
   },
 
@@ -844,6 +878,12 @@ const BLE = {
   },
 
   async send(cmd) {
+    if (this.simulating) {
+      // Simular respuesta exitosa
+      toast('Simulación: comando ' + cmd + ' enviado');
+      Sound.play('ok');
+      return true;
+    }
     if (!this.connected || !this.cmdChar) { toast('Sin conexión Bluetooth con el vehículo'); return false; }
     try {
       await this.cmdChar.writeValue(new TextEncoder().encode(cmd));
@@ -859,26 +899,23 @@ window.addEventListener('load', () => BLE.tryReconnect());
 
 // Vincular / desvincular ahora exige huella o PIN primero.
 async function pairPhoneSecure() {
-  if (BLE.connected) return; // ya conectado, no repetir
+  if (BLE.connected || BLE.simulating) return; // ya conectado o simulando
   const ok = await AppLock.confirm('Confirma para vincular el teléfono por Bluetooth');
   if (!ok) return;
   await BLE.connect();
 }
 
 // ==========================================================================
-// Proximidad real por fuerza de señal (RSSI) — solo mientras la app está
-// abierta (limitación de los navegadores, no hay forma de evitarlo).
+// Proximidad real (solo si BLE.connected, si no, simulación)
 // ==========================================================================
 const Proximity = {
   enabled: localStorage.getItem('centinela_proximity') === 'on',
   sensitivity: Number(localStorage.getItem('centinela_proximity_level') || 3),
   watching: false,
-  lastState: null, // 'near' | 'far'
+  lastState: null,
   debounceTimer: null,
 
-  levels: { // umbral en dBm y una zona de histéresis para no titilar
-    1: -50, 2: -60, 3: -70, 4: -80, 5: -90
-  },
+  levels: { 1: -50, 2: -60, 3: -70, 4: -80, 5: -90 },
   labels: { 1: 'Muy cerca', 2: 'Cerca', 3: 'Media', 4: 'Lejos', 5: 'Muy lejos' },
 
   init() {
@@ -891,7 +928,7 @@ const Proximity = {
     this.enabled = !this.enabled;
     el.classList.toggle('on', this.enabled);
     localStorage.setItem('centinela_proximity', this.enabled ? 'on' : 'off');
-    if (this.enabled && BLE.connected) this.start(); else this.stop();
+    if (this.enabled && (BLE.connected || BLE.simulating)) this.start(); else this.stop();
   },
 
   setSensitivity(val) {
@@ -901,8 +938,15 @@ const Proximity = {
   },
 
   async start() {
-    if (this.watching || !this.enabled || !BLE.device) return;
-    if (!BLE.device.watchAdvertisements) {
+    if (this.watching || !this.enabled || (!BLE.connected && !BLE.simulating)) return;
+    if (BLE.simulating) {
+      // Simular RSSI fluctuante
+      this.watching = true;
+      document.getElementById('proximityLiveCard').style.display = 'block';
+      this.simulateRSSI();
+      return;
+    }
+    if (!BLE.device || !BLE.device.watchAdvertisements) {
       toast('Tu navegador no soporta lectura de señal en segundo plano');
       return;
     }
@@ -914,6 +958,26 @@ const Proximity = {
     } catch (err) {
       toast('No se pudo activar la proximidad: ' + err.message);
     }
+  },
+
+  simulateRSSI() {
+    if (!this.watching) return;
+    const rssi = Math.floor(Math.random() * 20) - 80;
+    const label = document.getElementById('proximityRssiLabel');
+    if (label) label.textContent = rssi + ' dBm';
+    // Lógica simple de armado/desarmado basada en RSSI simulado
+    const threshold = this.levels[this.sensitivity];
+    clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => {
+      if (rssi >= threshold && this.lastState !== 'near') {
+        this.lastState = 'near';
+        if (app.dataset.armed === 'true') { doDisarm(); toast('Vehículo desarmado por proximidad (demo)'); }
+      } else if (rssi <= threshold - 8 && this.lastState !== 'far') {
+        this.lastState = 'far';
+        if (app.dataset.armed !== 'true') { doArm(); toast('Vehículo armado por alejamiento (demo)'); }
+      }
+      this.simulateRSSI();
+    }, 1500);
   },
 
   stop() {
@@ -928,17 +992,16 @@ const Proximity = {
     if (label) label.textContent = rssi + ' dBm';
 
     const threshold = this.levels[this.sensitivity];
-    const hysteresis = 8; // evita que arme/desarme en cadena en el borde
     clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
-      if (rssi >= threshold + hysteresis && this.lastState !== 'near') {
+      if (rssi >= threshold + 8 && this.lastState !== 'near') {
         this.lastState = 'near';
         if (app.dataset.armed === 'true') { doDisarm(); toast('Vehículo desarmado por proximidad'); }
-      } else if (rssi <= threshold - hysteresis && this.lastState !== 'far') {
+      } else if (rssi <= threshold - 8 && this.lastState !== 'far') {
         this.lastState = 'far';
         if (app.dataset.armed !== 'true') { doArm(); toast('Vehículo armado por alejamiento'); }
       }
-    }, 1500); // confirma la lectura antes de actuar, para evitar falsos positivos
+    }, 1500);
   }
 };
 Proximity.init();
@@ -979,7 +1042,6 @@ function setLock(locked, sendToBle = true) {
   const closedBtn = document.getElementById('lockBtnClosed');
   const openBtn = document.getElementById('lockBtnOpen');
   if (!closedBtn || !openBtn) return;
-  if (sendToBle && !BLE.connected) { toast('Conéctate por Bluetooth primero'); return; }
   closedBtn.classList.toggle('active', locked);
   openBtn.classList.toggle('active', !locked);
   if (sendToBle) {
@@ -1000,7 +1062,6 @@ function setGlass(side, pct) {
   if (label) label.textContent = pct + '%';
 }
 function moveWindow(side, delta) {
-  if (!BLE.connected) { toast('Conéctate por Bluetooth primero'); return; }
   windowState[side] = Math.max(0, Math.min(100, windowState[side] + delta));
   setGlass(side, windowState[side]);
   BLE.send('WIN_' + side + '_' + (delta > 0 ? 'UP' : 'DOWN'));
@@ -1016,7 +1077,6 @@ const lightState = {};
 lightIds.forEach(id => lightState[id] = false);
 
 function toggleLight(id) {
-  if (!BLE.connected) { toast('Conéctate por Bluetooth primero'); return; }
   const el = document.querySelector('.light-item[data-id="' + id + '"]');
   if (!el) return;
   const on = !lightState[id];
@@ -1052,13 +1112,11 @@ function showFaults(faults) {
 // Otras acciones
 // ==========================================================================
 function sendCmd(cmd, msg) {
-  if (!BLE.connected) { toast('Conéctate por Bluetooth primero'); return; }
   BLE.send(cmd);
   Sound.play('ok');
   if (msg) toast(msg);
 }
 function confirmStop() {
-  if (!BLE.connected) { toast('Conéctate por Bluetooth primero'); return; }
   if (confirm('¿Apagar el motor de forma remota? Esta acción solo se ejecuta si el vehículo está detenido.')) {
     BLE.send('STOP_ENGINE');
     Sound.play('ok');
@@ -1067,12 +1125,12 @@ function confirmStop() {
 }
 
 // ==========================================================================
-// Gestión de teléfonos vinculados — ahora protegida con huella/PIN
+// Gestión de teléfonos vinculados
 // ==========================================================================
 async function pairNewPhone() {
   const ok = await AppLock.confirm('Confirma para abrir la vinculación de un teléfono nuevo');
   if (!ok) return;
-  if (!BLE.connected) { await BLE.connect(); if (!BLE.connected) return; }
+  if (!BLE.connected && !BLE.simulating) { await BLE.connect(); if (!BLE.connected && !BLE.simulating) return; }
   if (confirm('¿Abrir 60 segundos para vincular un teléfono nuevo? Durante ese tiempo, cualquier teléfono que se conecte quedará autorizado.')) {
     BLE.send('PAIR_MODE');
     toast('Ventana de vinculación abierta — conecta el teléfono nuevo ahora');
@@ -1081,7 +1139,7 @@ async function pairNewPhone() {
 async function forgetPhonesSecure() {
   const ok = await AppLock.confirm('Confirma para olvidar todos los teléfonos vinculados');
   if (!ok) return;
-  if (!BLE.connected) { await BLE.connect(); if (!BLE.connected) return; }
+  if (!BLE.connected && !BLE.simulating) { await BLE.connect(); if (!BLE.connected && !BLE.simulating) return; }
   if (confirm('¿Olvidar los 2 teléfonos vinculados? Vas a necesitar volver a vincular este mismo teléfono también.')) {
     BLE.send('FORGET_PHONES');
     toast('Teléfonos olvidados — ventana de vinculación abierta 60s');
@@ -1089,7 +1147,7 @@ async function forgetPhonesSecure() {
 }
 
 // ==========================================================================
-// Interruptores genéricos decorativos (mapa, ajustes, etc.)
+// Interruptores genéricos decorativos
 // ==========================================================================
 document.querySelectorAll('.switch').forEach(sw => {
   if (['switchBiometric','switchProximity','switchSound'].includes(sw.id)) return;
@@ -1097,7 +1155,7 @@ document.querySelectorAll('.switch').forEach(sw => {
 });
 
 // ==========================================================================
-// Service Worker
+// Service Worker (opcional)
 // ==========================================================================
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
