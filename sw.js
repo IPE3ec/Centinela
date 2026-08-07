@@ -1,13 +1,6 @@
-// Service Worker — Centinela
-// Cachea el shell de la app para que abra incluso sin señal (útil en garajes/sótanos)
-
 const CACHE_NAME = 'centinela-v1';
 const APP_SHELL = [
-  './inicio.html',
-  './mapa.html',
-  './control.html',
-  './camara.html',
-  './ajustes.html',
+  './index.html',
   './styles.css',
   './app.js',
   './manifest.json',
@@ -32,7 +25,6 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Network-first para datos en vivo; cache-first para el shell estático
   event.respondWith(
     caches.match(event.request).then((cached) => {
       const fetchPromise = fetch(event.request)
