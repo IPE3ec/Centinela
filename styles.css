@@ -21,10 +21,19 @@ body{background:var(--bg); color:var(--text); font-family:'Inter',sans-serif; ov
 .status-pill.warn .dot{background:var(--warn); box-shadow:0 0 8px var(--warn);}
 
 .screens{flex:1; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch; position:relative;}
-.screen{display:none; padding:20px 20px calc(24px + var(--safe-bottom));}
-.screen.active{display:block; animation:fadein .22s ease;}
-@keyframes fadein{from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);}}
 
+.screen{display:none; padding:20px 20px calc(24px + var(--safe-bottom));}
+.screen.active{display:block;}
+.screen.exiting{animation:screenExit .15s ease forwards;}
+.screen.entering{animation:screenEnter .26s cubic-bezier(.16,1,.3,1);}
+@keyframes screenExit{
+  from{opacity:1; transform:translateY(0);}
+  to{opacity:0; transform:translateY(-8px);}
+}
+@keyframes screenEnter{
+  from{opacity:0; transform:translateY(14px) scale(.98);}
+  to{opacity:1; transform:translateY(0) scale(1);}
+}
 .eyebrow{font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:1.5px; color:var(--text-dim); text-transform:uppercase; margin-bottom:6px;}
 h1.screen-title{font-family:'Rajdhani',sans-serif; font-weight:700; font-size:26px; margin-bottom:20px;}
 
