@@ -1,652 +1,662 @@
-// ==========================================================================
-// UUIDs — deben coincidir con centinela_firmware.ino
-// ==========================================================================
-const BLE_SERVICE    = '12345678-1234-5678-1234-56789abcdef0';
-const BLE_CMD_CHAR    = '12345678-1234-5678-1234-56789abcdef1';
-const BLE_STATUS_CHAR = '12345678-1234-5678-1234-56789abcdef2';
+/* ============================================================
+   CENTINELA - app.js
+   Lógica de la PWA: conexión Bluetooth Web con el ESP32,
+   bloqueo de la app (huella/rostro + PIN), y control remoto
+   del vehículo (seguros, vidrios, luces, motor, sirena, etc).
 
-const app = document.getElementById('app');
+   Coincide con el firmware "CENTINELA v3.2":
+     SERVICE_UUID : 12345678-1234-5678-1234-56789abcdef0
+     CMD_UUID     : 12345678-1234-5678-1234-56789abcdef1 (write)
+     STATUS_UUID  : 12345678-1234-5678-1234-56789abcdef2 (notify)
+   ============================================================ */
 
-// ==========================================================================
-// Toast
-// ==========================================================================
-let toastTimer;
-function toast(msg) {
-  const el = document.getElementById('toast');
-  if (!el) return;
-  el.textContent = msg;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
-}
+(() => {
+  "use strict";
 
-// ==========================================================================
-// Router SPA
-// ==========================================================================
-const VALID_SCREENS = ['inicio','mapa','control','camara','ajustes'];
-function showScreen(name, push = true) {
-  if (!VALID_SCREENS.includes(name)) name = 'inicio';
-  document.querySelectorAll('.screen').forEach(s => s.classList.toggle('active', s.dataset.screen === name));
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.screen === name));
-  if (push) history.pushState({ screen: name }, '', '#' + name);
-  Sound.play('tap');
-}
-document.querySelectorAll('.tab, [data-goto]').forEach(el => {
-  el.addEventListener('click', (e) => {
-    e.preventDefault();
-    showScreen(el.dataset.screen || el.dataset.goto);
-  });
-});
-window.addEventListener('popstate', (e) => showScreen(e.state && e.state.screen ? e.state.screen : 'inicio', false));
-showScreen((location.hash || '#inicio').slice(1), false);
-history.replaceState({ screen: (location.hash || '#inicio').slice(1) }, '');
+  // ======================== CONFIG BLE ========================
+  const SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
+  const CMD_UUID     = "12345678-1234-5678-1234-56789abcdef1";
+  const STATUS_UUID  = "12345678-1234-5678-1234-56789abcdef2";
 
-// ==========================================================================
-// Sonidos
-// ==========================================================================
-const Sound = {
-  ctx: null,
-  enabled: localStorage.getItem('centinela_sound') !== 'off',
-  ensureCtx() { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); return this.ctx; },
-  beep(freq, dur, type = 'sine', gain = 0.05) {
-    if (!this.enabled) return;
-    try {
-      const ctx = this.ensureCtx();
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = type; osc.frequency.value = freq;
-      g.gain.value = gain;
-      osc.connect(g); g.connect(ctx.destination);
-      osc.start();
-      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
-      osc.stop(ctx.currentTime + dur);
-    } catch (err) { /* audio no disponible */ }
-  },
-  play(name) {
-    switch (name) {
-      case 'tap': this.beep(500, .04, 'sine', .02); break;
-      case 'arm': this.beep(880, .12); this.beep(1180, .12); break;
-      case 'disarm': this.beep(660, .12); break;
-      case 'lock': this.beep(740, .08); break;
-      case 'unlock': this.beep(520, .08); break;
-      case 'connect': this.beep(600, .08); this.beep(900, .12); break;
-      case 'disconnect': this.beep(400, .18, 'sawtooth', .03); break;
-      case 'error': this.beep(220, .22, 'square', .04); break;
-      case 'ok': this.beep(760, .1); break;
+  const BLE_SUPPORTED = !!(navigator.bluetooth);
+
+  // ======================== ESTADO GLOBAL ========================
+  const state = {
+    device: null,
+    server: null,
+    cmdChar: null,
+    statusChar: null,
+    connected: false,
+    connecting: false,
+    vehicle: {
+      armed: true,
+      locked: true,
+      engine: false,
+      doorOpen: false,
+      parked: true,
+      battery: 12.6,
+      windowL: 35,
+      windowR: 35,
+      lights: {}
     }
-  },
-  toggle(el) {
-    this.enabled = !this.enabled;
-    el.classList.toggle('on', this.enabled);
-    localStorage.setItem('centinela_sound', this.enabled ? 'on' : 'off');
-    if (this.enabled) this.play('ok');
+  };
+
+  // ======================== UTILIDADES ========================
+  const $ = (id) => document.getElementById(id);
+
+  function showToast(msg, type = "ok") {
+    const el = $("toast");
+    if (!el) return;
+    el.textContent = msg;
+    el.className = "toast show " + type;
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => { el.className = "toast"; }, 2600);
+    Sound.play(type);
   }
-};
-document.getElementById('switchSound').classList.toggle('on', Sound.enabled);
 
-// ==========================================================================
-// Bloqueo de la app con configuración inicial obligatoria
-// ==========================================================================
-const AppLock = {
-  biometricEnabled: localStorage.getItem('centinela_bio') === 'on',
-  credentialId: localStorage.getItem('centinela_cred_id'),
-  pinHash: localStorage.getItem('centinela_pin_hash'),
-  pendingResolve: null,
-  pinBuffer: '',
-  _pinMode: '',
-  _pinFirst: '',
-  _afterSetupConfirm: false,
+  async function sha256Hex(text) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+  }
 
-  async sha256(text) {
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-  },
+  function setLastActivity() {
+    const el = $("lastActivity");
+    if (el) el.textContent = "justo ahora";
+  }
 
-  supportsWebAuthn() {
-    return window.PublicKeyCredential && navigator.credentials;
-  },
+  // ======================== NAVEGACIÓN ENTRE PANTALLAS ========================
+  function goToScreen(name) {
+    document.querySelectorAll(".screen").forEach(s => s.classList.toggle("active", s.dataset.screen === name));
+    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.screen === name));
+  }
 
-  refreshSettingsUI() {
-    document.getElementById('switchBiometric').classList.toggle('on', this.biometricEnabled);
-    document.getElementById('bioStatusSub').textContent = this.biometricEnabled ? 'Activo en este teléfono' : 'Usa el lector de tu teléfono';
-    document.getElementById('pinStatusSub').textContent = this.pinHash ? 'Configurado' : 'No configurado';
-  },
-
-  async setupBiometric() {
-    if (!this.supportsWebAuthn()) {
-      toast('Este navegador no soporta desbloqueo biométrico');
-      return;
-    }
-    try {
-      const cred = await navigator.credentials.create({
-        publicKey: {
-          challenge: crypto.getRandomValues(new Uint8Array(32)),
-          rp: { name: 'Centinela' },
-          user: { id: crypto.getRandomValues(new Uint8Array(16)), name: 'conductor', displayName: 'Conductor' },
-          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
-          authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
-          timeout: 60000
-        }
+  function initNavigation() {
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", (e) => {
+        e.preventDefault();
+        goToScreen(tab.dataset.screen);
       });
-      this.credentialId = btoa(String.fromCharCode(...new Uint8Array(cred.rawId)));
-      localStorage.setItem('centinela_cred_id', this.credentialId);
-      this.biometricEnabled = true;
-      localStorage.setItem('centinela_bio', 'on');
-      toast('Huella/rostro configurado');
-      Sound.play('ok');
-      this.refreshSettingsUI();
-      this.checkSecurityConfigured();
-    } catch (err) {
-      toast('No se pudo configurar: ' + err.message);
-    }
-  },
-
-  async toggleBiometric(el) {
-    if (this.biometricEnabled) {
-      this.biometricEnabled = false;
-      localStorage.setItem('centinela_bio', 'off');
-      this.refreshSettingsUI();
-      return;
-    }
-    this.setupBiometric();
-  },
-
-  isSecurityConfigured() {
-    return this.biometricEnabled || (this.pinHash && this.pinHash.length > 0);
-  },
-
-  checkSecurityConfigured() {
-    if (this.isSecurityConfigured()) {
-      document.getElementById('configOverlay').hidden = true;
-      document.getElementById('keyLinkCard').style.pointerEvents = 'auto';
-      document.getElementById('keyLinkCard').style.opacity = '1';
-      toast('Seguridad configurada. Ahora puedes vincular tu teléfono.');
-    } else {
-      document.getElementById('configOverlay').hidden = false;
-      document.getElementById('keyLinkCard').style.pointerEvents = 'none';
-      document.getElementById('keyLinkCard').style.opacity = '0.5';
-    }
-  },
-
-  async tryBiometricUnlock() {
-    if (!this.biometricEnabled || !this.supportsWebAuthn()) { this.openPinEntry(); return; }
-    try {
-      await navigator.credentials.get({
-        publicKey: {
-          challenge: crypto.getRandomValues(new Uint8Array(32)),
-          allowCredentials: [{ id: Uint8Array.from(atob(this.credentialId), c => c.charCodeAt(0)), type: 'public-key' }],
-          userVerification: 'required',
-          timeout: 60000
-        }
+    });
+    document.querySelectorAll("[data-goto]").forEach(link => {
+      link.addEventListener("click", (e) => {
+        e.preventDefault();
+        goToScreen(link.dataset.goto);
       });
-      this.onUnlockSuccess();
-    } catch (err) {
-      toast('No se reconoció la huella/rostro — intenta de nuevo o usa PIN');
+    });
+  }
+
+  // ======================== BLUETOOTH ========================
+  const Vehicle = {
+    async connect() {
+      if (!BLE_SUPPORTED) {
+        showToast("Este navegador no soporta Bluetooth Web. Usa Chrome/Edge en Android.", "warn");
+        return false;
+      }
+      if (state.connecting) return false;
+      state.connecting = true;
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }],
+          optionalServices: [SERVICE_UUID]
+        });
+        state.device = device;
+        device.addEventListener("gattserverdisconnected", Vehicle.onDisconnected);
+
+        showToast("Vinculando con el vehículo…", "ok");
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const cmdChar = await service.getCharacteristic(CMD_UUID);
+        const statusChar = await service.getCharacteristic(STATUS_UUID);
+
+        await statusChar.startNotifications();
+        statusChar.addEventListener("characteristicvaluechanged", Vehicle.onStatusNotify);
+
+        state.server = server;
+        state.cmdChar = cmdChar;
+        state.statusChar = statusChar;
+        state.connected = true;
+
+        // Leer estado inicial
+        try {
+          const val = await statusChar.readValue();
+          Vehicle.applyStatus(val);
+        } catch (_) { /* algunos firmwares solo notifican, está bien */ }
+
+        Vehicle.updateConnectionUI();
+        showToast("Teléfono conectado al vehículo", "ok");
+        return true;
+      } catch (err) {
+        console.error(err);
+        if (err.name !== "NotFoundError") {
+          showToast("No se pudo vincular: " + err.message, "warn");
+        }
+        return false;
+      } finally {
+        state.connecting = false;
+      }
+    },
+
+    onDisconnected() {
+      state.connected = false;
+      state.cmdChar = null;
+      state.statusChar = null;
+      Vehicle.updateConnectionUI();
+      showToast("Se perdió la conexión con el vehículo", "warn");
+    },
+
+    onStatusNotify(event) {
+      Vehicle.applyStatus(event.target.value);
+    },
+
+    applyStatus(dataView) {
+      try {
+        const text = new TextDecoder().decode(dataView.buffer ? dataView : dataView.value);
+        const data = JSON.parse(text);
+        Object.assign(state.vehicle, {
+          armed: !!data.armed,
+          locked: !!data.locked,
+          engine: !!data.engine,
+          doorOpen: !!data.doorOpen,
+          parked: !!data.parked,
+          battery: typeof data.battery === "number" ? data.battery : state.vehicle.battery,
+          windowL: typeof data.windowL === "number" ? data.windowL : state.vehicle.windowL,
+          windowR: typeof data.windowR === "number" ? data.windowR : state.vehicle.windowR,
+          lights: data.lights || state.vehicle.lights
+        });
+        if (data.ack && data.message) {
+          showToast(data.message, data.ok ? "ok" : "warn");
+        }
+        Vehicle.updateVehicleUI();
+        setLastActivity();
+      } catch (e) {
+        console.warn("Estado BLE ilegible:", e);
+      }
+    },
+
+    async send(cmd, okLabel) {
+      if (!state.connected || !state.cmdChar) {
+        const ok = await Vehicle.connect();
+        if (!ok || !state.cmdChar) {
+          showToast("Vincula tu teléfono primero", "warn");
+          return false;
+        }
+      }
+      try {
+        await state.cmdChar.writeValue(new TextEncoder().encode(cmd));
+        if (okLabel) showToast(okLabel, "ok");
+        setLastActivity();
+        return true;
+      } catch (err) {
+        console.error(err);
+        showToast("No se pudo enviar el comando", "warn");
+        return false;
+      }
+    },
+
+    updateConnectionUI() {
+      const pill = $("statusPill");
+      const dot = $("statusDot");
+      const pillText = $("statusPillText");
+      const keyTitle = $("keyLinkTitle");
+      const keySub = $("keyLinkSub");
+      const beam = $("beam");
+
+      if (state.connected) {
+        pill?.classList.add("connected");
+        dot?.classList.add("on");
+        if (pillText) pillText.textContent = "Conectado";
+        if (keyTitle) keyTitle.textContent = "Vinculado con el vehículo";
+        if (keySub) keySub.textContent = "Bluetooth activo";
+        if (beam) beam.style.opacity = "1";
+      } else {
+        pill?.classList.remove("connected");
+        dot?.classList.remove("on");
+        if (pillText) pillText.textContent = "Sin conexión";
+        if (keyTitle) keyTitle.textContent = "Toca para vincular por Bluetooth";
+        if (keySub) keySub.textContent = "Sin conexión";
+        if (beam) beam.style.opacity = ".35";
+      }
+    },
+
+    updateVehicleUI() {
+      const v = state.vehicle;
+
+      // Escudo (armado/desarmado)
+      const app = $("app");
+      const shieldLabel = $("shieldLabel");
+      const shieldSubState = $("shieldSubState");
+      app?.setAttribute("data-armed", v.armed ? "true" : "false");
+      if (shieldLabel) shieldLabel.textContent = v.armed ? "ARMADO" : "DESARMADO";
+      if (shieldSubState) shieldSubState.textContent = v.armed ? "activo" : "en pausa";
+
+      // Seguros
+      $("lockBtnClosed")?.classList.toggle("active", v.locked);
+      $("lockBtnOpen")?.classList.toggle("active", !v.locked);
+
+      // Vidrios
+      const glassL = $("glassL"), glassR = $("glassR");
+      const pctL = $("pctL"), pctR = $("pctR");
+      if (glassL) glassL.style.height = v.windowL + "%";
+      if (glassR) glassR.style.height = v.windowR + "%";
+      if (pctL) pctL.textContent = v.windowL + "%";
+      if (pctR) pctR.textContent = v.windowR + "%";
+
+      // Luces
+      document.querySelectorAll(".light-item").forEach(btn => {
+        const id = btn.dataset.id;
+        btn.classList.toggle("active", !!v.lights[id]);
+      });
     }
-  },
+  };
 
-  onUnlockSuccess() {
-    document.getElementById('lockOverlay').hidden = true;
-    this.closePinOverlay();
-    Sound.play('ok');
-    if (this.pendingResolve) { const r = this.pendingResolve; this.pendingResolve = null; r(true); }
-  },
+  // Comandos usados desde el HTML
+  window.pairPhoneSecure = async function () {
+    AppLock.requireAuth(async () => {
+      await Vehicle.connect();
+    }, "Confirma tu identidad para vincular un teléfono");
+  };
 
-  showLockScreenIfNeeded() {
-    if (!this.isSecurityConfigured()) {
-      document.getElementById('configOverlay').hidden = false;
-      document.getElementById('keyLinkCard').style.pointerEvents = 'none';
-      document.getElementById('keyLinkCard').style.opacity = '0.5';
+  window.pairNewPhone = function () {
+    if (!state.connected) {
+      showToast("Primero conecta el teléfono ya vinculado", "warn");
       return;
     }
-    document.getElementById('configOverlay').hidden = true;
-    document.getElementById('keyLinkCard').style.pointerEvents = 'auto';
-    document.getElementById('keyLinkCard').style.opacity = '1';
-    if (this.biometricEnabled || this.pinHash) {
-      document.getElementById('lockOverlay').hidden = false;
-      if (this.biometricEnabled) this.tryBiometricUnlock();
-    }
-  },
+    AppLock.requireAuth(async () => {
+      await Vehicle.send("PAIR_MODE", "Modo de vinculación abierto por 60 s");
+    }, "Confirma tu identidad para abrir un espacio nuevo");
+  };
 
-  confirm(reason) {
-    return new Promise(async (resolve) => {
-      if (!this.isSecurityConfigured()) {
-        toast('Primero debes configurar la seguridad');
-        this.showLockScreenIfNeeded();
-        resolve(false);
+  window.forgetPhonesSecure = function () {
+    AppLock.requireAuth(() => {
+      if (!confirm("Esto olvidará los 2 teléfonos vinculados y tendrás que emparejar de nuevo. ¿Continuar?")) return;
+      Vehicle.send("FORGET_PHONES", "Teléfonos olvidados; vinculación abierta");
+    }, "Confirma tu identidad para olvidar los teléfonos");
+  };
+
+  window.setLock = function (closed) {
+    Vehicle.send(closed ? "LOCK" : "UNLOCK", closed ? "Seguros cerrados" : "Seguros abiertos");
+  };
+
+  window.moveWindow = function (side, delta) {
+    const dir = delta > 0 ? "UP" : "DOWN";
+    const cmd = "WIN_" + side + "_" + dir;
+    Vehicle.send(cmd);
+  };
+
+  window.toggleLight = function (id) {
+    const isOn = !!state.vehicle.lights[id];
+    Vehicle.send("LIGHT:" + id + ":" + (isOn ? "OFF" : "ON"));
+  };
+
+  window.sendCmd = function (cmd, label) {
+    Vehicle.send(cmd, label);
+  };
+
+  window.confirmStop = function () {
+    if (!confirm("¿Apagar el motor de forma remota? Solo funciona con el vehículo detenido.")) return;
+    Vehicle.send("STOP_ENGINE", "Motor apagado");
+  };
+
+  function initShieldButton() {
+    $("shieldBtn")?.addEventListener("click", () => {
+      const willArm = !state.vehicle.armed;
+      Vehicle.send(willArm ? "ARM" : "DISARM", willArm ? "Vehículo armado" : "Vehículo desarmado");
+    });
+  }
+
+  // ======================== BLOQUEO DE APP (AppLock) ========================
+  const LOCK_KEY = "centinela_lock_cfg";
+
+  function loadLockCfg() {
+    try { return JSON.parse(localStorage.getItem(LOCK_KEY)) || {}; }
+    catch (_) { return {}; }
+  }
+  function saveLockCfg(cfg) {
+    localStorage.setItem(LOCK_KEY, JSON.stringify(cfg));
+  }
+
+  const AppLock = {
+    cfg: loadLockCfg(),
+    unlocked: false,
+    pendingPin: "",
+    pinMode: null,       // 'setup' | 'confirm-setup' | 'unlock' | 'auth'
+    firstPinEntry: "",
+    onAuthSuccess: null,
+
+    init() {
+      this.refreshSettingsUI();
+      if (!this.cfg.biometric && !this.cfg.pinHash) {
+        $("configOverlay").hidden = false;
+      } else {
+        this.lockApp();
+      }
+    },
+
+    refreshSettingsUI() {
+      $("switchBiometric")?.classList.toggle("on", !!this.cfg.biometric);
+      const bioSub = $("bioStatusSub");
+      if (bioSub) bioSub.textContent = this.cfg.biometric ? "Activado" : "Usa el lector de tu teléfono";
+      const pinSub = $("pinStatusSub");
+      if (pinSub) pinSub.textContent = this.cfg.pinHash ? "Configurado" : "No configurado";
+    },
+
+    lockApp() {
+      this.unlocked = false;
+      $("lockOverlay").hidden = false;
+      $("configOverlay").hidden = true;
+    },
+
+    unlockApp() {
+      this.unlocked = true;
+      $("lockOverlay").hidden = true;
+      $("configOverlay").hidden = true;
+    },
+
+    async setupBiometric() {
+      if (!window.PublicKeyCredential) {
+        showToast("Tu navegador no soporta huella/rostro (WebAuthn)", "warn");
         return;
       }
-      this.pendingResolve = resolve;
-      document.getElementById('pinOverlayTitle').textContent = 'Confirma tu identidad';
-      document.getElementById('pinOverlaySub').textContent = reason || 'Necesario para continuar';
-      if (this.biometricEnabled) {
-        await this.tryBiometricUnlock();
-      } else {
-        this.openPinEntry();
+      try {
+        await navigator.credentials.create({
+          publicKey: {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            rp: { name: "Centinela" },
+            user: {
+              id: crypto.getRandomValues(new Uint8Array(16)),
+              name: "conductor@centinela.app",
+              displayName: "Conductor Centinela"
+            },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+            timeout: 60000
+          }
+        });
+        this.cfg.biometric = true;
+        saveLockCfg(this.cfg);
+        this.refreshSettingsUI();
+        showToast("Huella / rostro configurado", "ok");
+        $("configOverlay").hidden = true;
+        this.unlockApp();
+      } catch (err) {
+        console.error(err);
+        showToast("No se pudo configurar huella/rostro", "warn");
       }
-    });
-  },
+    },
 
-  openPinSetup(afterConfirm = false) {
-    this.pinBuffer = '';
-    this._pinMode = 'setup-1';
-    this._pinFirst = '';
-    document.getElementById('pinOverlayTitle').textContent = 'Crea un PIN';
-    document.getElementById('pinOverlaySub').textContent = 'Se usará para desbloquear la app y vincular teléfonos';
-    document.getElementById('pinError').textContent = '';
-    this.renderPinDots();
-    document.getElementById('pinOverlay').hidden = false;
-    this._afterSetupConfirm = afterConfirm;
-  },
+    toggleBiometric(el) {
+      if (this.cfg.biometric) {
+        if (!this.cfg.pinHash && !confirm("Sin PIN de respaldo no podrás entrar si falla la huella. ¿Desactivar de todos modos?")) return;
+        this.cfg.biometric = false;
+        saveLockCfg(this.cfg);
+        el.classList.remove("on");
+        this.refreshSettingsUI();
+      } else {
+        this.setupBiometric();
+      }
+    },
 
-  openPinEntry() {
-    this.pinBuffer = '';
-    this._pinMode = 'verify';
-    document.getElementById('pinOverlayTitle').textContent = 'Ingresa tu PIN';
-    document.getElementById('pinOverlaySub').textContent = 'Toca los números para desbloquear';
-    document.getElementById('pinError').textContent = '';
-    this.renderPinDots();
-    document.getElementById('pinOverlay').hidden = false;
-  },
+    async tryBiometricUnlock() {
+      if (!this.cfg.biometric || !window.PublicKeyCredential) {
+        showToast("Huella/rostro no configurado, usa tu PIN", "warn");
+        return;
+      }
+      try {
+        await navigator.credentials.get({
+          publicKey: {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            userVerification: "required",
+            timeout: 60000
+          }
+        });
+        this.unlockApp();
+        if (this.onAuthSuccess) { const fn = this.onAuthSuccess; this.onAuthSuccess = null; fn(); }
+      } catch (err) {
+        showToast("No se reconoció tu huella/rostro", "warn");
+      }
+    },
 
-  closePinOverlay() {
-    document.getElementById('pinOverlay').hidden = true;
-    if (this.pendingResolve && this._pinMode === 'verify') {
-      const r = this.pendingResolve; this.pendingResolve = null; r(false);
-    }
-  },
-
-  renderPinDots() {
-    document.querySelectorAll('#pinDots span').forEach((dot, i) => dot.classList.toggle('filled', i < this.pinBuffer.length));
-  },
-
-  async pinPress(n) {
-    if (this.pinBuffer.length >= 4) return;
-    this.pinBuffer += String(n);
-    this.renderPinDots();
-    if (this.pinBuffer.length < 4) return;
-
-    if (this._pinMode === 'setup-1') {
-      this._pinFirst = this.pinBuffer;
-      this.pinBuffer = '';
-      this._pinMode = 'setup-2';
-      document.getElementById('pinOverlaySub').textContent = 'Confirma el PIN otra vez';
+    // ---- PIN ----
+    openPinSetup() {
+      this.pinMode = this.cfg.pinHash ? "confirm-setup" : "setup";
+      this.firstPinEntry = "";
+      this.pendingPin = "";
+      $("pinOverlayTitle").textContent = "Crea tu PIN";
+      $("pinOverlaySub").textContent = "4 dígitos para desbloquear Centinela";
+      $("pinError").textContent = "";
       this.renderPinDots();
-      return;
-    }
-    if (this._pinMode === 'setup-2') {
-      if (this.pinBuffer !== this._pinFirst) {
-        document.getElementById('pinError').textContent = 'No coincide, intenta de nuevo';
-        this.pinBuffer = ''; this._pinMode = 'setup-1'; this._pinFirst = '';
+      $("pinOverlay").hidden = false;
+    },
+
+    openPinEntry() {
+      this.pinMode = "unlock";
+      this.pendingPin = "";
+      $("pinOverlayTitle").textContent = "Ingresa tu PIN";
+      $("pinOverlaySub").textContent = "Por seguridad, confirma con tu PIN";
+      $("pinError").textContent = "";
+      this.renderPinDots();
+      $("pinOverlay").hidden = false;
+    },
+
+    requireAuth(callback, subtitle) {
+      // Si la app no tiene ningún candado configurado (no debería pasar), permite directo
+      if (!this.cfg.biometric && !this.cfg.pinHash) { callback(); return; }
+      this.onAuthSuccess = callback;
+      if (this.cfg.biometric) {
+        $("lockOverlay").querySelector(".lock-sub").textContent = subtitle || "Usa tu huella o rostro para continuar";
+        $("lockOverlay").hidden = false;
+      } else {
+        this.pinMode = "auth";
+        this.pendingPin = "";
+        $("pinOverlayTitle").textContent = "Confirma tu PIN";
+        $("pinOverlaySub").textContent = subtitle || "Por seguridad, confirma con tu PIN";
+        $("pinError").textContent = "";
+        this.renderPinDots();
+        $("pinOverlay").hidden = false;
+      }
+    },
+
+    renderPinDots() {
+      const dots = $("pinDots")?.querySelectorAll("span");
+      if (!dots) return;
+      dots.forEach((dot, i) => dot.classList.toggle("filled", i < this.pendingPin.length));
+    },
+
+    async pinPress(n) {
+      if (this.pendingPin.length >= 4) return;
+      this.pendingPin += String(n);
+      this.renderPinDots();
+      if (this.pendingPin.length === 4) await this.completePinEntry();
+    },
+
+    pinBackspace() {
+      this.pendingPin = this.pendingPin.slice(0, -1);
+      this.renderPinDots();
+      $("pinError").textContent = "";
+    },
+
+    async completePinEntry() {
+      const pin = this.pendingPin;
+      const hash = await sha256Hex(pin);
+
+      if (this.pinMode === "setup") {
+        this.firstPinEntry = hash;
+        this.pendingPin = "";
+        this.pinMode = "confirm-new";
+        $("pinOverlayTitle").textContent = "Confirma tu PIN";
+        $("pinOverlaySub").textContent = "Vuelve a ingresarlo";
         this.renderPinDots();
         return;
       }
-      this.pinHash = await this.sha256(this.pinBuffer);
-      localStorage.setItem('centinela_pin_hash', this.pinHash);
-      this.refreshSettingsUI();
-      toast('PIN configurado');
-      document.getElementById('pinOverlay').hidden = true;
-      this.checkSecurityConfigured();
-      if (this._afterSetupConfirm) { this.onUnlockSuccess(); }
-      return;
-    }
-    if (this._pinMode === 'verify') {
-      const hash = await this.sha256(this.pinBuffer);
-      if (hash === this.pinHash) {
-        this.onUnlockSuccess();
-      } else {
-        document.getElementById('pinError').textContent = 'PIN incorrecto';
-        Sound.play('error');
-        this.pinBuffer = '';
+
+      if (this.pinMode === "confirm-new") {
+        if (hash !== this.firstPinEntry) {
+          $("pinError").textContent = "Los PIN no coinciden. Intenta de nuevo.";
+          this.pendingPin = "";
+          this.pinMode = "setup";
+          $("pinOverlayTitle").textContent = "Crea tu PIN";
+          $("pinOverlaySub").textContent = "4 dígitos para desbloquear Centinela";
+          this.renderPinDots();
+          return;
+        }
+        this.cfg.pinHash = hash;
+        saveLockCfg(this.cfg);
+        this.refreshSettingsUI();
+        this.closePinOverlay();
+        showToast("PIN configurado", "ok");
+        $("configOverlay").hidden = true;
+        this.unlockApp();
+        return;
+      }
+
+      if (this.pinMode === "confirm-setup") {
+        // Cambiar PIN existente: valida el actual primero
+        if (hash !== this.cfg.pinHash) {
+          $("pinError").textContent = "PIN incorrecto";
+          this.pendingPin = "";
+          this.renderPinDots();
+          return;
+        }
+        this.pinMode = "setup";
+        this.pendingPin = "";
+        $("pinOverlayTitle").textContent = "Crea tu nuevo PIN";
+        $("pinOverlaySub").textContent = "4 dígitos nuevos";
         this.renderPinDots();
+        return;
       }
-    }
-  },
 
-  pinBackspace() {
-    this.pinBuffer = this.pinBuffer.slice(0, -1);
-    document.getElementById('pinError').textContent = '';
-    this.renderPinDots();
-  }
-};
-
-AppLock.refreshSettingsUI();
-AppLock.checkSecurityConfigured();
-AppLock.showLockScreenIfNeeded();
-
-// ==========================================================================
-// Módulo BLE – real, sin simulaciones
-// ==========================================================================
-const BLE = {
-  device: null, cmdChar: null, statusChar: null, connected: false,
-
-  updateLinkUI() {
-    const pill = document.getElementById('statusPill');
-    const dot = document.getElementById('statusDot');
-    const text = document.getElementById('statusPillText');
-    const title = document.getElementById('keyLinkTitle');
-    const sub = document.getElementById('keyLinkSub');
-    const beam = document.getElementById('beam');
-    pill.classList.toggle('on', this.connected);
-    if (title) title.textContent = this.connected ? 'Llave digital vinculada' : 'Toca para vincular por Bluetooth';
-    if (sub) sub.textContent = this.connected ? 'Bluetooth · conectado' : 'Sin conexión';
-    if (beam) beam.style.opacity = this.connected ? '1' : '.35';
-    if (!this.connected) { text.textContent = 'Sin conexión'; return; }
-    text.textContent = app.dataset.armed === 'true' ? 'ARMADO' : 'DESARMADO';
-  },
-
-  onStatusUpdate(event) {
-    try {
-      const s = JSON.parse(new TextDecoder().decode(event.target.value));
-      if (typeof s.armed === 'boolean') {
-        app.dataset.armed = String(s.armed);
-        const label = document.getElementById('shieldLabel'), sub = document.getElementById('shieldSubState');
-        if (label) label.textContent = s.armed ? 'ARMADO' : 'DESARMADO';
-        if (sub) sub.textContent = s.armed ? 'activo' : 'en pausa';
+      if (this.pinMode === "unlock" || this.pinMode === "auth") {
+        if (hash !== this.cfg.pinHash) {
+          $("pinError").textContent = "PIN incorrecto";
+          this.pendingPin = "";
+          this.renderPinDots();
+          return;
+        }
+        const wasAuth = this.pinMode === "auth";
+        this.closePinOverlay();
+        this.unlockApp();
+        if (wasAuth && this.onAuthSuccess) {
+          const fn = this.onAuthSuccess; this.onAuthSuccess = null; fn();
+        }
+        return;
       }
-      if (typeof s.locked === 'boolean') setLock(s.locked, false);
-      if (typeof s.windowL === 'number') { windowState.L = s.windowL; setGlass('L', s.windowL); }
-      if (typeof s.windowR === 'number') { windowState.R = s.windowR; setGlass('R', s.windowR); }
-      if (s.lights && typeof s.lights === 'object') Object.keys(s.lights).forEach(id => setLightRemote(id, s.lights[id]));
-      if (Array.isArray(s.faults)) showFaults(s.faults);
-      BLE.updateLinkUI();
-    } catch (err) { /* estado no válido */ }
-  },
+    },
 
-  onDisconnected() {
-    BLE.connected = false;
-    BLE.updateLinkUI();
-    Sound.play('disconnect');
-    toast('Se perdió la conexión Bluetooth con el vehículo');
-    Proximity.stop();
-  },
-
-  async gattConnect() {
-    const server = await this.device.gatt.connect();
-    const service = await server.getPrimaryService(BLE_SERVICE);
-    this.cmdChar = await service.getCharacteristic(BLE_CMD_CHAR);
-    this.statusChar = await service.getCharacteristic(BLE_STATUS_CHAR);
-    await this.statusChar.startNotifications();
-    this.statusChar.addEventListener('characteristicvaluechanged', this.onStatusUpdate);
-    this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
-    this.connected = true;
-    this.updateLinkUI();
-    Sound.play('connect');
-    toast('Vinculado con el vehículo por Bluetooth');
-    if (Proximity.enabled) Proximity.start();
-  },
-
-  async connect() {
-    if (!navigator.bluetooth) {
-      toast('Este navegador no soporta Bluetooth (usa Chrome en Android)');
-      return;
+    closePinOverlay() {
+      $("pinOverlay").hidden = true;
+      this.pendingPin = "";
+      this.pinMode = null;
     }
-    try {
-      this.device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] });
-      await this.gattConnect();
-    } catch (err) {
-      Sound.play('error');
-      toast('No se pudo vincular: ' + err.message);
-    }
-  },
+  };
+  window.AppLock = AppLock;
 
-  async tryReconnect() {
-    if (!navigator.bluetooth || !navigator.bluetooth.getDevices) return;
-    try {
-      const devices = await navigator.bluetooth.getDevices();
-      if (devices.length) { this.device = devices[0]; await this.gattConnect(); }
-    } catch (err) { /* fuera de rango o apagado */ }
-  },
+  // ======================== PROXIMIDAD ========================
+  const PROX_KEY = "centinela_proximity";
+  const Proximity = {
+    cfg: JSON.parse(localStorage.getItem(PROX_KEY) || "{}"),
+    watching: false,
 
-  async send(cmd) {
-    if (!this.connected || !this.cmdChar) { 
-      toast('Sin conexión Bluetooth con el vehículo');
-      return false;
-    }
-    try {
-      await this.cmdChar.writeValue(new TextEncoder().encode(cmd));
-      return true;
-    } catch (err) {
-      Sound.play('error');
-      toast('Error enviando comando: ' + err.message);
-      return false;
-    }
-  }
-};
-window.addEventListener('load', () => BLE.tryReconnect());
+    save() { localStorage.setItem(PROX_KEY, JSON.stringify(this.cfg)); },
 
-async function pairPhoneSecure() {
-  if (BLE.connected) return;
-  const ok = await AppLock.confirm('Confirma para vincular el teléfono por Bluetooth');
-  if (!ok) return;
-  await BLE.connect();
-}
+    init() {
+      $("switchProximity")?.classList.toggle("on", !!this.cfg.enabled);
+      const v = this.cfg.sensitivity || 3;
+      const slider = $("proximitySlider");
+      if (slider) slider.value = v;
+      this.setSensitivity(v, false);
+    },
 
-// ==========================================================================
-// Proximidad real (solo si BLE.connected)
-// ==========================================================================
-const Proximity = {
-  enabled: localStorage.getItem('centinela_proximity') === 'on',
-  sensitivity: Number(localStorage.getItem('centinela_proximity_level') || 3),
-  watching: false,
-  lastState: null,
-  debounceTimer: null,
+    toggle(el) {
+      this.cfg.enabled = !this.cfg.enabled;
+      this.save();
+      el.classList.toggle("on", this.cfg.enabled);
+      $("proximityLiveCard").style.display = this.cfg.enabled ? "block" : "none";
+      if (this.cfg.enabled) this.startWatching();
+      else this.stopWatching();
+    },
 
-  levels: { 1: -50, 2: -60, 3: -70, 4: -80, 5: -90 },
-  labels: { 1: 'Muy cerca', 2: 'Cerca', 3: 'Media', 4: 'Lejos', 5: 'Muy lejos' },
+    setSensitivity(val, save = true) {
+      this.cfg.sensitivity = Number(val);
+      if (save) this.save();
+      const labels = ["", "Muy cerca", "Cerca", "Media", "Lejos", "Muy lejos"];
+      const el = $("proximityValLabel");
+      if (el) el.textContent = labels[this.cfg.sensitivity] || "Media";
+    },
 
-  init() {
-    document.getElementById('switchProximity').classList.toggle('on', this.enabled);
-    document.getElementById('proximitySlider').value = this.sensitivity;
-    document.getElementById('proximityValLabel').textContent = this.labels[this.sensitivity];
-  },
-
-  toggle(el) {
-    this.enabled = !this.enabled;
-    el.classList.toggle('on', this.enabled);
-    localStorage.setItem('centinela_proximity', this.enabled ? 'on' : 'off');
-    if (this.enabled && BLE.connected) this.start(); else this.stop();
-  },
-
-  setSensitivity(val) {
-    this.sensitivity = Number(val);
-    localStorage.setItem('centinela_proximity_level', String(this.sensitivity));
-    document.getElementById('proximityValLabel').textContent = this.labels[this.sensitivity];
-  },
-
-  async start() {
-    if (this.watching || !this.enabled || !BLE.connected || !BLE.device) return;
-    if (!BLE.device.watchAdvertisements) {
-      toast('Tu navegador no soporta lectura de señal en segundo plano');
-      return;
-    }
-    try {
-      BLE.device.addEventListener('advertisementreceived', (e) => this.handleAdvertisement(e));
-      await BLE.device.watchAdvertisements();
-      this.watching = true;
-      document.getElementById('proximityLiveCard').style.display = 'block';
-    } catch (err) {
-      toast('No se pudo activar la proximidad: ' + err.message);
-    }
-  },
-
-  stop() {
-    this.watching = false;
-    document.getElementById('proximityLiveCard').style.display = 'none';
-  },
-
-  handleAdvertisement(event) {
-    const rssi = event.rssi;
-    if (typeof rssi !== 'number') return;
-    const label = document.getElementById('proximityRssiLabel');
-    if (label) label.textContent = rssi + ' dBm';
-
-    const threshold = this.levels[this.sensitivity];
-    clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(() => {
-      if (rssi >= threshold + 8 && this.lastState !== 'near') {
-        this.lastState = 'near';
-        if (app.dataset.armed === 'true') { doDisarm(); toast('Vehículo desarmado por proximidad'); }
-      } else if (rssi <= threshold - 8 && this.lastState !== 'far') {
-        this.lastState = 'far';
-        if (app.dataset.armed !== 'true') { doArm(); toast('Vehículo armado por alejamiento'); }
+    async startWatching() {
+      if (this.watching) return;
+      if (!("watchAdvertisements" in BluetoothDevice.prototype || {})) {
+        showToast("Tu navegador no soporta monitoreo de proximidad en segundo plano", "warn");
+        return;
       }
-    }, 1500);
-  }
-};
-Proximity.init();
+      if (!state.device) {
+        showToast("Vincula el vehículo primero para activar proximidad", "warn");
+        return;
+      }
+      try {
+        state.device.addEventListener("advertisementreceived", (evt) => {
+          if (typeof evt.rssi === "number") {
+            const el = $("proximityRssiLabel");
+            if (el) el.textContent = evt.rssi + " dBm";
+          }
+        });
+        await state.device.watchAdvertisements();
+        this.watching = true;
+      } catch (err) {
+        console.warn(err);
+      }
+    },
 
-// ==========================================================================
-// Armado / desarmado
-// ==========================================================================
-const shieldBtn = document.getElementById('shieldBtn');
-const shieldLabel = document.getElementById('shieldLabel');
-const shieldSubState = document.getElementById('shieldSubState');
+    stopWatching() {
+      this.watching = false;
+    }
+  };
+  window.Proximity = Proximity;
 
-function doArm() {
-  app.dataset.armed = 'true';
-  shieldBtn.setAttribute('aria-pressed', 'true');
-  shieldLabel.textContent = 'ARMADO'; shieldSubState.textContent = 'activo';
-  BLE.updateLinkUI();
-  BLE.send('ARM');
-  Sound.play('arm');
-}
-function doDisarm() {
-  app.dataset.armed = 'false';
-  shieldBtn.setAttribute('aria-pressed', 'false');
-  shieldLabel.textContent = 'DESARMADO'; shieldSubState.textContent = 'en pausa';
-  BLE.updateLinkUI();
-  BLE.send('DISARM');
-  Sound.play('disarm');
-}
-shieldBtn.addEventListener('click', () => {
-  const armed = app.dataset.armed === 'true';
-  if (armed) doDisarm(); else doArm();
-  toast(armed ? 'Vehículo desarmado' : 'Vehículo armado');
-});
+  // ======================== SONIDO ========================
+  const SOUND_KEY = "centinela_sound";
+  const Sound = {
+    enabled: localStorage.getItem(SOUND_KEY) !== "off",
+    ctx: null,
 
-// ==========================================================================
-// Seguros
-// ==========================================================================
-function setLock(locked, sendToBle = true) {
-  const closedBtn = document.getElementById('lockBtnClosed');
-  const openBtn = document.getElementById('lockBtnOpen');
-  if (!closedBtn || !openBtn) return;
-  closedBtn.classList.toggle('active', locked);
-  openBtn.classList.toggle('active', !locked);
-  if (sendToBle) {
-    BLE.send(locked ? 'LOCK' : 'UNLOCK');
-    Sound.play(locked ? 'lock' : 'unlock');
-    toast(locked ? 'Seguros cerrados' : 'Seguros abiertos');
-  }
-}
+    init() {
+      $("switchSound")?.classList.toggle("on", this.enabled);
+    },
 
-// ==========================================================================
-// Vidrios
-// ==========================================================================
-const windowState = { L: 35, R: 35 };
-function setGlass(side, pct) {
-  const glass = document.getElementById('glass' + side);
-  const label = document.getElementById('pct' + side);
-  if (glass) glass.style.height = pct + '%';
-  if (label) label.textContent = pct + '%';
-}
-function moveWindow(side, delta) {
-  windowState[side] = Math.max(0, Math.min(100, windowState[side] + delta));
-  setGlass(side, windowState[side]);
-  BLE.send('WIN_' + side + '_' + (delta > 0 ? 'UP' : 'DOWN'));
-  const zona = side === 'L' ? 'delantero' : 'trasero';
-  toast((delta > 0 ? 'Subiendo' : 'Bajando') + ' vidrio ' + zona + '…');
-}
+    toggle(el) {
+      this.enabled = !this.enabled;
+      localStorage.setItem(SOUND_KEY, this.enabled ? "on" : "off");
+      el.classList.toggle("on", this.enabled);
+    },
 
-// ==========================================================================
-// Luces
-// ==========================================================================
-const lightIds = ['LOWBEAM','HIGHBEAM','TURN_L','TURN_R','BRAKE','REVERSE','FOG','PARK'];
-const lightState = {};
-lightIds.forEach(id => lightState[id] = false);
+    play(type) {
+      if (!this.enabled) return;
+      try {
+        this.ctx = this.ctx || new (window.AudioContext || window.webkitAudioContext)();
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.frequency.value = type === "warn" ? 220 : 880;
+        gain.gain.value = 0.06;
+        osc.connect(gain).connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + 0.12);
+      } catch (_) { /* audio no disponible, ignorar */ }
+    }
+  };
+  window.Sound = Sound;
 
-function toggleLight(id) {
-  const el = document.querySelector('.light-item[data-id="' + id + '"]');
-  if (!el) return;
-  const on = !lightState[id];
-  lightState[id] = on;
-  el.classList.toggle('on', on);
-  BLE.send('LIGHT:' + id + ':' + (on ? 'ON' : 'OFF'));
-  const label = el.querySelector('.light-item-label').textContent;
-  toast((on ? 'Encendiendo' : 'Apagando') + ' luces ' + label.toLowerCase());
-}
-function setLightRemote(id, on) {
-  const el = document.querySelector('.light-item[data-id="' + id + '"]');
-  if (!el) return;
-  lightState[id] = on;
-  el.classList.toggle('on', on);
-}
-function showFaults(faults) {
-  const banner = document.getElementById('lightFaultBanner');
-  const text = document.getElementById('lightFaultText');
-  if (!banner || !text) return;
-  document.querySelectorAll('.light-item').forEach(el => el.classList.remove('fault'));
-  if (!faults || faults.length === 0) { banner.style.display = 'none'; return; }
-  faults.forEach(f => {
-    document.querySelectorAll('.light-item').forEach(el => {
-      const label = el.querySelector('.light-item-label').textContent;
-      if (f.toLowerCase().startsWith(label.toLowerCase())) el.classList.add('fault');
-    });
+  // ======================== ARRANQUE ========================
+  document.addEventListener("DOMContentLoaded", () => {
+    initNavigation();
+    initShieldButton();
+    Vehicle.updateConnectionUI();
+    Vehicle.updateVehicleUI();
+    Proximity.init();
+    Sound.init();
+    AppLock.init();
+
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    }
   });
-  banner.style.display = 'flex';
-  text.textContent = faults.length === 1 ? faults[0] : faults.length + ' focos con posible falla';
-}
-
-// ==========================================================================
-// Otras acciones
-// ==========================================================================
-function sendCmd(cmd, msg) {
-  BLE.send(cmd);
-  Sound.play('ok');
-  if (msg) toast(msg);
-}
-function confirmStop() {
-  if (confirm('¿Apagar el motor de forma remota? Esta acción solo se ejecuta si el vehículo está detenido.')) {
-    BLE.send('STOP_ENGINE');
-    Sound.play('ok');
-    toast('Solicitud de apagado enviada');
-  }
-}
-
-// ==========================================================================
-// Gestión de teléfonos vinculados
-// ==========================================================================
-async function pairNewPhone() {
-  const ok = await AppLock.confirm('Confirma para abrir la vinculación de un teléfono nuevo');
-  if (!ok) return;
-  if (!BLE.connected) { await BLE.connect(); if (!BLE.connected) return; }
-  if (confirm('¿Abrir 60 segundos para vincular un teléfono nuevo? Durante ese tiempo, cualquier teléfono que se conecte quedará autorizado.')) {
-    BLE.send('PAIR_MODE');
-    toast('Ventana de vinculación abierta — conecta el teléfono nuevo ahora');
-  }
-}
-async function forgetPhonesSecure() {
-  const ok = await AppLock.confirm('Confirma para olvidar todos los teléfonos vinculados');
-  if (!ok) return;
-  if (!BLE.connected) { await BLE.connect(); if (!BLE.connected) return; }
-  if (confirm('¿Olvidar los 2 teléfonos vinculados? Vas a necesitar volver a vincular este mismo teléfono también.')) {
-    BLE.send('FORGET_PHONES');
-    toast('Teléfonos olvidados — ventana de vinculación abierta 60s');
-  }
-}
-
-// ==========================================================================
-// Interruptores genéricos decorativos
-// ==========================================================================
-document.querySelectorAll('.switch').forEach(sw => {
-  if (['switchBiometric','switchProximity','switchSound'].includes(sw.id)) return;
-  sw.addEventListener('click', () => sw.classList.toggle('on'));
-});
-
-// ==========================================================================
-// Service Worker (opcional)
-// ==========================================================================
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
-}
+})();
