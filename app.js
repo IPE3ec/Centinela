@@ -170,13 +170,38 @@ function goToScreen(name) {
       Vehicle.applyStatus(event.target.value);
     },
 
-    function validateVehicleStatus(data) {
-  const required = ['armed', 'locked', 'engine', 'battery'];
-  if (!required.every(k => k in data)) {
-    throw new Error('Datos BLE inválidos');
-  }
-  return data;
-        Object.assign(state.vehicle, {
+    applyStatus(dataView) {
+try {
+const text = new TextDecoder().decode(dataView.buffer ? dataView : dataView.value);
+const data = JSON.parse(text);
+         
+// ✅ VALIDACIÓN AGREGADA
+const required = ['armed', 'locked', 'engine', 'battery'];
+if (!required.every(k => typeof data[k] !== 'undefined')) {
+throw new Error('Datos BLE inválidos: faltan campos requeridos');
+}
+         
+Object.assign(state.vehicle, {
+armed: !!data.armed,
+locked: !!data.locked,
+engine: !!data.engine,
+doorOpen: !!data.doorOpen,
+parked: !!data.parked,
+battery: typeof data.battery === "number" ? data.battery : state.vehicle.battery,
+windowL: typeof data.windowL === "number" ? data.windowL : state.vehicle.windowL,
+windowR: typeof data.windowR === "number" ? data.windowR : state.vehicle.windowR,
+lights: data.lights || state.vehicle.lights
+});
+if (data.ack && data.message) {
+showToast(data.message, data.ok ? "ok" : "warn");
+}
+Vehicle.updateVehicleUI();
+setLastActivity();
+} catch (e) {
+console.warn("Estado BLE ilegible:", e);
+}
+},
+     Object.assign(state.vehicle, {
           armed: !!data.armed,
           locked: !!data.locked,
           engine: !!data.engine,
@@ -197,26 +222,30 @@ function goToScreen(name) {
       }
     },
 
-    async send(cmd, okLabel) {
-      if (!state.connected || !state.cmdChar) {
-        const ok = await Vehicle.connect();
-        if (!ok || !state.cmdChar) {
-          showToast("Vincula tu teléfono primero", "warn");
-          return false;
-        }
-      }
-      try {
-        await state.cmdChar.writeValue(new TextEncoder().encode(cmd));
-        if (okLabel) showToast(okLabel, "ok");
-        setLastActivity();
-        return true;
-      } catch (err) {
-        console.error(err);
-        showToast("No se pudo enviar el comando", "warn");
-        return false;
-      }
-    },
-
+   async send(cmd, okLabel) {
+if (!state.connected || !state.cmdChar) {
+const ok = await Vehicle.connect();
+         if (!ok || !state.cmdChar) {
+           showToast("Vincula tu teléfono primero", "warn");
+           return false;
+         }
+       }
+       try {
+         // ✅ AGREGAR NONCE Y TIMESTAMP
+         const nonce = Math.random().toString(36).slice(2, 11);
+         const timestamp = Date.now();
+         const secureCmd = ${cmd}|${nonce}|${timestamp};
+         
+         await state.cmdChar.writeValue(new TextEncoder().encode(secureCmd));
+         if (okLabel) showToast(okLabel, "ok");
+         setLastActivity();
+         return true;
+       } catch (err) {
+         console.error(err);
+         showToast("No se pudo enviar el comando", "warn");
+         return false;
+       }
+     },
     updateConnectionUI() {
       const pill = $("statusPill");
       const dot = $("statusDot");
@@ -330,14 +359,14 @@ function goToScreen(name) {
 
   // ======================== BLOQUEO DE APP (AppLock) ========================
   const LOCK_KEY = "centinela_lock_cfg";
-
-  function loadLockCfg() {
-    try { return JSON.parse(localStorage.getItem(LOCK_KEY)) || {}; }
-    catch (_) { return {}; }
-  }
-  function saveLockCfg(cfg) {
-    localStorage.setItem(LOCK_KEY, JSON.stringify(cfg));
-  }
+ 
+function loadLockCfg() {
+try { return JSON.parse(sessionStorage.getItem(LOCK_KEY)) || {}; }
+catch (_) { return {}; }
+}
+function saveLockCfg(cfg) {
+sessionStorage.setItem(LOCK_KEY, JSON.stringify(cfg));
+}
 
   const AppLock = {
     cfg: loadLockCfg(),
