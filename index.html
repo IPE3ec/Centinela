@@ -9,7 +9,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-/* ===== Estilos (sin cambios respecto al original) ===== */
 :root{
   --bg:#0A0D12; --surface:#131822; --surface-2:#1B2230; --border:#232B3A;
   --text:#EDF1F5; --text-dim:#7C8797; --accent:#00E5B0; --accent-dim:#0A3D34;
@@ -107,7 +106,6 @@ h1.screen-title{font-family:'Rajdhani',sans-serif; font-weight:700; font-size:26
 .ctrl-btn.danger svg{stroke:var(--danger);}
 .ctrl-btn.danger:active{border-color:var(--danger);}
 .ctrl-btn.full{grid-column:1 / -1; flex-direction:row; align-items:center; justify-content:space-between;}
-/* Los botones NUNCA se deshabilitan, solo muestran error si no hay BLE */
 .ctrl-btn.disabled, .segmented-btn.disabled, .light-item.disabled, .window-btns button.disabled{opacity:.4; pointer-events:none;}
 
 .cam-feed{height:220px; border-radius:var(--radius); border:1px solid var(--border); background:linear-gradient(160deg, #10141c, #080a0e); display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; margin-bottom:16px; position:relative; overflow:hidden;}
@@ -183,7 +181,6 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
 .fault-banner{display:flex; align-items:center; gap:10px; background:var(--danger-dim); border:1px solid rgba(255,71,87,.4); border-radius:12px; padding:12px 14px; margin-bottom:12px; font-size:12.5px; font-weight:500; color:var(--text);}
 .fault-banner svg{width:18px; height:18px; stroke:var(--danger); flex-shrink:0;}
 
-/* ---------- Proximidad ---------- */
 .proximity-meter{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-bottom:10px;}
 .proximity-meter-top{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px;}
 .proximity-meter-val{font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-dim);}
@@ -191,7 +188,6 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
 .range::-webkit-slider-thumb{-webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:var(--accent); box-shadow:0 0 10px rgba(0,229,176,.5); cursor:pointer;}
 .range-labels{display:flex; justify-content:space-between; font-size:10.5px; color:var(--text-dim); margin-top:6px;}
 
-/* ---------- Overlay de bloqueo / modales ---------- */
 .overlay{position:fixed; inset:0; background:rgba(6,8,12,.92); backdrop-filter:blur(6px); display:flex; align-items:center; justify-content:center; z-index:100; padding:24px;}
 .overlay[hidden]{display:none;}
 .lock-card, .modal-card{width:100%; max-width:340px; background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:26px 22px; text-align:center;}
@@ -439,6 +435,18 @@ a:focus-visible, button:focus-visible{outline:2px solid var(--accent);}
   <div class="toast" id="toast"></div>
 </div>
 
+<!-- ===================== Overlay: configuración inicial (obligatoria) ===================== -->
+<div class="overlay" id="configOverlay" hidden>
+  <div class="lock-card">
+    <div class="lock-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 8.4-8 11-4.6-2.6-8-6-8-11V5l8-3z"/></svg></div>
+    <div class="lock-title">Configuración inicial</div>
+    <div class="lock-sub">Para usar Centinela, primero debes configurar un método de seguridad.<br>Esto protegerá tu vehículo y tus datos.</div>
+    <button class="btn-primary" onclick="AppLock.setupBiometric()">Configurar huella / rostro</button>
+    <button class="btn-secondary" onclick="AppLock.openPinSetup()">Configurar PIN</button>
+    <p style="font-size:11px; color:var(--text-dim); margin-top:14px;">Puedes configurar ambos o solo uno. Al menos uno es obligatorio.</p>
+  </div>
+</div>
+
 <!-- ===================== Overlay: bloqueo de la app ===================== -->
 <div class="overlay" id="lockOverlay" hidden>
   <div class="lock-card">
@@ -555,7 +563,7 @@ const Sound = {
 document.getElementById('switchSound').classList.toggle('on', Sound.enabled);
 
 // ==========================================================================
-// Bloqueo de la app (sin modo demo)
+// Bloqueo de la app con configuración inicial obligatoria
 // ==========================================================================
 const AppLock = {
   biometricEnabled: localStorage.getItem('centinela_bio') === 'on',
@@ -563,6 +571,9 @@ const AppLock = {
   pinHash: localStorage.getItem('centinela_pin_hash'),
   pendingResolve: null,
   pinBuffer: '',
+  _pinMode: '',
+  _pinFirst: '',
+  _afterSetupConfirm: false,
 
   async sha256(text) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -579,13 +590,8 @@ const AppLock = {
     document.getElementById('pinStatusSub').textContent = this.pinHash ? 'Configurado' : 'No configurado';
   },
 
-  async toggleBiometric(el) {
-    if (this.biometricEnabled) {
-      this.biometricEnabled = false;
-      localStorage.setItem('centinela_bio', 'off');
-      this.refreshSettingsUI();
-      return;
-    }
+  // Método para configurar biometría desde el overlay inicial
+  async setupBiometric() {
     if (!this.supportsWebAuthn()) {
       toast('Este navegador no soporta desbloqueo biométrico');
       return;
@@ -607,10 +613,38 @@ const AppLock = {
       localStorage.setItem('centinela_bio', 'on');
       toast('Huella/rostro configurado');
       Sound.play('ok');
+      this.refreshSettingsUI();
+      this.checkSecurityConfigured();
     } catch (err) {
       toast('No se pudo configurar: ' + err.message);
     }
-    this.refreshSettingsUI();
+  },
+
+  async toggleBiometric(el) {
+    if (this.biometricEnabled) {
+      this.biometricEnabled = false;
+      localStorage.setItem('centinela_bio', 'off');
+      this.refreshSettingsUI();
+      return;
+    }
+    this.setupBiometric();
+  },
+
+  isSecurityConfigured() {
+    return this.biometricEnabled || (this.pinHash && this.pinHash.length > 0);
+  },
+
+  checkSecurityConfigured() {
+    if (this.isSecurityConfigured()) {
+      document.getElementById('configOverlay').hidden = true;
+      document.getElementById('keyLinkCard').style.pointerEvents = 'auto';
+      document.getElementById('keyLinkCard').style.opacity = '1';
+      toast('Seguridad configurada. Ahora puedes vincular tu teléfono.');
+    } else {
+      document.getElementById('configOverlay').hidden = false;
+      document.getElementById('keyLinkCard').style.pointerEvents = 'none';
+      document.getElementById('keyLinkCard').style.opacity = '0.5';
+    }
   },
 
   async tryBiometricUnlock() {
@@ -638,6 +672,15 @@ const AppLock = {
   },
 
   showLockScreenIfNeeded() {
+    if (!this.isSecurityConfigured()) {
+      document.getElementById('configOverlay').hidden = false;
+      document.getElementById('keyLinkCard').style.pointerEvents = 'none';
+      document.getElementById('keyLinkCard').style.opacity = '0.5';
+      return;
+    }
+    document.getElementById('configOverlay').hidden = true;
+    document.getElementById('keyLinkCard').style.pointerEvents = 'auto';
+    document.getElementById('keyLinkCard').style.opacity = '1';
     if (this.biometricEnabled || this.pinHash) {
       document.getElementById('lockOverlay').hidden = false;
       if (this.biometricEnabled) this.tryBiometricUnlock();
@@ -646,10 +689,10 @@ const AppLock = {
 
   confirm(reason) {
     return new Promise(async (resolve) => {
-      if (!this.biometricEnabled && !this.pinHash) {
-        toast('Configura una huella o PIN para vincular el teléfono');
-        this.openPinSetup(true);
-        this.pendingResolve = resolve;
+      if (!this.isSecurityConfigured()) {
+        toast('Primero debes configurar la seguridad');
+        this.showLockScreenIfNeeded();
+        resolve(false);
         return;
       }
       this.pendingResolve = resolve;
@@ -722,6 +765,7 @@ const AppLock = {
       this.refreshSettingsUI();
       toast('PIN configurado');
       document.getElementById('pinOverlay').hidden = true;
+      this.checkSecurityConfigured();
       if (this._afterSetupConfirm) { this.onUnlockSuccess(); }
       return;
     }
@@ -744,7 +788,9 @@ const AppLock = {
     this.renderPinDots();
   }
 };
+
 AppLock.refreshSettingsUI();
+AppLock.checkSecurityConfigured();
 AppLock.showLockScreenIfNeeded();
 
 // ==========================================================================
@@ -766,7 +812,6 @@ const BLE = {
     if (beam) beam.style.opacity = this.connected ? '1' : '.35';
     if (!this.connected) { text.textContent = 'Sin conexión'; return; }
     text.textContent = app.dataset.armed === 'true' ? 'ARMADO' : 'DESARMADO';
-    // Los botones NO se deshabilitan nunca, pero al presionar se comprueba conexión en cada acción
   },
 
   onStatusUpdate(event) {
@@ -849,7 +894,6 @@ const BLE = {
 };
 window.addEventListener('load', () => BLE.tryReconnect());
 
-// Vincular / desvincular ahora exige huella o PIN primero.
 async function pairPhoneSecure() {
   if (BLE.connected) return;
   const ok = await AppLock.confirm('Confirma para vincular el teléfono por Bluetooth');
