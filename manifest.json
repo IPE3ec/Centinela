@@ -2,7 +2,7 @@
   "name": "Centinela — Control Vehicular",
   "short_name": "Centinela",
   "description": "Control remoto de tu vehículo desde el móvil",
-  "start_url": "inicio.html",
+  "start_url": "index.html",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#0A0D12",
