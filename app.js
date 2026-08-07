@@ -170,13 +170,12 @@ function goToScreen(name) {
       Vehicle.applyStatus(event.target.value);
     },
 
-   function validateVehicleStatus(data) {
+    function validateVehicleStatus(data) {
   const required = ['armed', 'locked', 'engine', 'battery'];
   if (!required.every(k => k in data)) {
     throw new Error('Datos BLE inválidos');
   }
   return data;
-}
         Object.assign(state.vehicle, {
           armed: !!data.armed,
           locked: !!data.locked,
