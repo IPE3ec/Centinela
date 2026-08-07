@@ -65,11 +65,33 @@
   }
 
   // ======================== NAVEGACIÓN ENTRE PANTALLAS ========================
-  function goToScreen(name) {
-    document.querySelectorAll(".screen").forEach(s => s.classList.toggle("active", s.dataset.screen === name));
-    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.screen === name));
-  }
+  
+function goToScreen(name) {
+  const current = document.querySelector(".screen.active");
+  const next = document.querySelector(`.screen[data-screen="${name}"]`);
+  if (!next || next === current) return;
 
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.screen === name));
+
+  const showNext = () => {
+    next.classList.add("active", "entering");
+    const clearEnter = () => next.classList.remove("entering");
+    next.addEventListener("animationend", clearEnter, { once: true });
+    setTimeout(clearEnter, 300); // respaldo por si animationend no dispara
+  };
+
+  if (current) {
+    current.classList.add("exiting");
+    const finishExit = () => {
+      current.classList.remove("active", "exiting");
+      showNext();
+    };
+    current.addEventListener("animationend", finishExit, { once: true });
+    setTimeout(finishExit, 200); // respaldo
+  } else {
+    showNext();
+  }
+}
   function initNavigation() {
     document.querySelectorAll(".tab").forEach(tab => {
       tab.addEventListener("click", (e) => {
